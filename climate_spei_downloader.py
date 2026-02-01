@@ -484,7 +484,8 @@ class ClimateProjectionsDownloader:
         import numpy as np
 
         url = self._get_opendap_url(model)
-        ds = xr.open_dataset(url)
+        # Use pydap engine to avoid netCDF4 SSL issues on macOS
+        ds = xr.open_dataset(url, engine='pydap')
 
         try:
             # Use centroid for faster remote access
