@@ -1,0 +1,4 @@
+#!/bin/bash
+cd "/Users/markshahinian/claude-workspace/climate data"
+source venv/bin/activate
+python3 climate_spei_downloader.py "$@"
