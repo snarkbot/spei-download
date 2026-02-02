@@ -428,7 +428,8 @@ class ClimateProjectionsDownloader:
     """Downloads future SPEI projections from MACA via THREDDS OPeNDAP."""
 
     # THREDDS server with pre-computed SPEI projections
-    THREDDS_BASE = "https://tds-proxy.nkn.uidaho.edu/thredds/dodsC"
+    # Use dap2:// protocol prefix to explicitly specify DAP2 and avoid pydap warnings
+    THREDDS_BASE = "dap2://tds-proxy.nkn.uidaho.edu/thredds/dodsC"
     SPEI_MONTHS = 12
     RCP = "rcp45"
 
@@ -454,25 +455,34 @@ class ClimateProjectionsDownloader:
 
         Returns tuple of (DataFrame, list of failed models)
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         print("\n--- Downloading Climate Projections (MACA RCP 4.5) ---")
         geometry = county_info['geometry']
 
         print(f"Extracting SPEI projections for {county_info['name']} County...")
-        print(f"Models: {', '.join(self.TARGET_MODELS)}")
+        print(f"Models: {', '.join(self.TARGET_MODELS)} (downloading in parallel)")
 
         results = {'Year': list(range(2020, 2100))}
         failed_models = []
 
-        for model in self.TARGET_MODELS:
-            try:
-                print(f"  {model}...", end=" ", flush=True)
-                model_data = self._download_model(model, geometry)
-                results[model] = model_data
-                print(f"OK ({len([v for v in model_data if v is not None])} years)")
-            except Exception as e:
-                print(f"Failed: {e}")
-                results[model] = [None] * len(results['Year'])
-                failed_models.append(model)
+        # Download all models in parallel
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_model = {
+                executor.submit(self._download_model, model, geometry): model
+                for model in self.TARGET_MODELS
+            }
+
+            for future in as_completed(future_to_model):
+                model = future_to_model[future]
+                try:
+                    model_data = future.result()
+                    results[model] = model_data
+                    print(f"  {model}... OK ({len([v for v in model_data if v is not None])} years)")
+                except Exception as e:
+                    print(f"  {model}... Failed: {e}")
+                    results[model] = [None] * len(results['Year'])
+                    failed_models.append(model)
 
         df = pd.DataFrame(results)
         success_count = len(self.TARGET_MODELS) - len(failed_models)
