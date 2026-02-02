@@ -13,6 +13,16 @@ import os
 import sys
 import time
 import re
+import warnings
+
+# Suppress HDF5 error messages when xarray probes file types
+os.environ['HDF5_DISABLE_VERSION_CHECK'] = '1'
+try:
+    import h5py
+    h5py._errors.silence_errors()
+except (ImportError, AttributeError):
+    pass
+
 import requests
 import pandas as pd
 import xarray as xr
@@ -21,6 +31,9 @@ from pathlib import Path
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
+
+# Suppress xarray FutureWarning about Dataset.dims
+warnings.filterwarnings('ignore', category=FutureWarning, module='xarray')
 
 # Selenium imports
 from selenium import webdriver
@@ -209,16 +222,9 @@ class WestWideDroughtTracker:
             print(f"Extracting data for {county_info['name']} County polygon...")
             ds = xr.open_dataset(cache_file)
 
-            # Find grid cells within county polygon
-            grid_cells = self._get_cells_in_polygon(ds, geometry)
-            print(f"Found {len(grid_cells)} grid cells within county boundary")
-
-            if not grid_cells:
-                raise ValueError("No grid cells found within county polygon")
-
-            # Extract and average data for all cells
+            # Extract and average data using vectorized operations
             print("Averaging SPEI values across county...")
-            df = self._extract_polygon_average(ds, grid_cells)
+            df = self._extract_polygon_average(ds, geometry)
 
             ds.close()
 
@@ -231,55 +237,61 @@ class WestWideDroughtTracker:
             print("Generating placeholder data structure...")
             return self._generate_placeholder_data(), error_msg
 
-    def _get_cells_in_polygon(self, ds, geometry) -> list:
-        """Find all grid cells whose centers fall within the county polygon."""
-        from shapely.geometry import Point
+    def _create_polygon_mask(self, ds, geometry):
+        """Create a boolean mask for grid cells within the polygon (vectorized)."""
+        import numpy as np
+        from shapely import contains_xy
 
         lats = ds['latitude'].values
         lons = ds['longitude'].values
 
-        # Get bounding box to limit search
-        minx, miny, maxx, maxy = geometry.bounds
+        # Create 2D coordinate grids
+        lon_grid, lat_grid = np.meshgrid(lons, lats)
 
-        # Find cells within polygon
-        cells = []
-        for lat in lats:
-            if lat < miny or lat > maxy:
-                continue
-            for lon in lons:
-                if lon < minx or lon > maxx:
-                    continue
-                if geometry.contains(Point(lon, lat)):
-                    cells.append((lat, lon))
+        # Vectorized point-in-polygon test
+        mask = contains_xy(geometry, lon_grid, lat_grid)
 
-        return cells
+        return mask, lats, lons
 
-    def _extract_polygon_average(self, ds, grid_cells: list) -> pd.DataFrame:
-        """Extract SPEI data and average across all grid cells in polygon."""
+    def _extract_polygon_average(self, ds, geometry) -> pd.DataFrame:
+        """Extract SPEI data and average across all grid cells in polygon (vectorized)."""
         import numpy as np
 
-        all_data = []
+        # Create mask for cells in polygon
+        mask, lats, lons = self._create_polygon_mask(ds, geometry)
+        n_cells = mask.sum()
 
-        for lat, lon in grid_cells:
-            data = ds['data'].sel(latitude=lat, longitude=lon, method='nearest')
-            df = data.to_dataframe().reset_index()
-            df['cell'] = f"{lat},{lon}"
-            all_data.append(df)
+        if n_cells == 0:
+            raise ValueError("No grid cells found within county polygon")
 
-        # Combine all cells
-        combined = pd.concat(all_data, ignore_index=True)
+        print(f"Found {n_cells} grid cells within county boundary")
 
-        # Extract year
-        combined['Year'] = pd.to_datetime(combined['day']).dt.year
+        # Get bounding box indices to subset data
+        lat_in_mask = mask.any(axis=1)
+        lon_in_mask = mask.any(axis=0)
 
-        # Average across all cells for each year
-        annual_data = combined.groupby('Year')['data'].mean().reset_index()
+        lat_min_idx, lat_max_idx = np.where(lat_in_mask)[0][[0, -1]]
+        lon_min_idx, lon_max_idx = np.where(lon_in_mask)[0][[0, -1]]
+
+        # Subset the data and mask to bounding box
+        data_subset = ds['data'].isel(
+            latitude=slice(lat_min_idx, lat_max_idx + 1),
+            longitude=slice(lon_min_idx, lon_max_idx + 1)
+        )
+        mask_subset = mask[lat_min_idx:lat_max_idx + 1, lon_min_idx:lon_max_idx + 1]
+
+        # Apply mask and compute mean across spatial dimensions
+        # Broadcasting: mask_subset is (lat, lon), data_subset is (time, lat, lon)
+        masked_data = data_subset.where(mask_subset)
+        annual_mean = masked_data.mean(dim=['latitude', 'longitude'])
+
+        # Convert to DataFrame
+        df = annual_mean.to_dataframe().reset_index()
+        df['Year'] = pd.to_datetime(df['day']).dt.year
+        annual_data = df.groupby('Year')['data'].mean().reset_index()
         annual_data.columns = ['Year', 'SPEI']
 
-        # Sort by year
-        annual_data = annual_data.sort_values('Year').reset_index(drop=True)
-
-        return annual_data
+        return annual_data.sort_values('Year').reset_index(drop=True)
 
     def _generate_placeholder_data(self) -> pd.DataFrame:
         """Generate placeholder structure for manual data entry."""
@@ -310,16 +322,9 @@ class GridMETDownloader:
             print("Opening GridMET OPeNDAP dataset...")
             ds = xr.open_dataset(self.OPENDAP_URL)
 
-            # Find grid cells within county polygon
-            grid_cells = self._get_cells_in_polygon(ds, geometry)
-            print(f"Found {len(grid_cells)} grid cells within county boundary")
-
-            if not grid_cells:
-                raise ValueError("No grid cells found within county polygon")
-
-            # Extract and average data for all cells
+            # Extract and average data using vectorized operations
             print("Averaging SPEI values across county...")
-            annual_data = self._extract_polygon_average(ds, grid_cells, 'spei')
+            annual_data = self._extract_polygon_average(ds, geometry)
 
             ds.close()
             print(f"Retrieved {len(annual_data)} years of data from GridMET")
@@ -330,59 +335,62 @@ class GridMETDownloader:
             print("Attempting alternative GridMET access method...")
             return self._download_alternative(county_info)
 
-    def _get_cells_in_polygon(self, ds, geometry) -> list:
-        """Find all grid cells whose centers fall within the county polygon."""
-        from shapely.geometry import Point
+    def _create_polygon_mask(self, ds, geometry):
+        """Create a boolean mask for grid cells within the polygon (vectorized)."""
+        import numpy as np
+        from shapely import contains_xy
 
         lats = ds['lat'].values
         lons = ds['lon'].values
 
-        # Get bounding box to limit search
-        minx, miny, maxx, maxy = geometry.bounds
+        # Create 2D coordinate grids
+        lon_grid, lat_grid = np.meshgrid(lons, lats)
 
-        # Find cells within polygon
-        cells = []
-        for lat in lats:
-            if lat < miny or lat > maxy:
-                continue
-            for lon in lons:
-                if lon < minx or lon > maxx:
-                    continue
-                if geometry.contains(Point(lon, lat)):
-                    cells.append((lat, lon))
+        # Vectorized point-in-polygon test
+        mask = contains_xy(geometry, lon_grid, lat_grid)
 
-        return cells
+        return mask, lats, lons
 
-    def _extract_polygon_average(self, ds, grid_cells: list, spei_var: str) -> pd.DataFrame:
-        """Extract SPEI data and average across all grid cells in polygon."""
+    def _extract_polygon_average(self, ds, geometry) -> pd.DataFrame:
+        """Extract SPEI data and average across all grid cells in polygon (vectorized)."""
         import numpy as np
 
-        all_data = []
+        # Create mask for cells in polygon
+        mask, lats, lons = self._create_polygon_mask(ds, geometry)
+        n_cells = mask.sum()
 
-        for lat, lon in grid_cells:
-            data = ds[spei_var].sel(lat=lat, lon=lon, method='nearest')
-            df = data.to_dataframe().reset_index()
-            df['cell'] = f"{lat},{lon}"
-            all_data.append(df)
+        if n_cells == 0:
+            raise ValueError("No grid cells found within county polygon")
 
-        # Combine all cells
-        combined = pd.concat(all_data, ignore_index=True)
+        print(f"Found {n_cells} grid cells within county boundary")
 
-        # Find time column
-        time_col = 'day' if 'day' in combined.columns else 'time'
+        # Get bounding box indices to subset data
+        lat_in_mask = mask.any(axis=1)
+        lon_in_mask = mask.any(axis=0)
 
-        # Extract year and month
-        combined['year'] = pd.to_datetime(combined[time_col]).dt.year
-        combined['month'] = pd.to_datetime(combined[time_col]).dt.month
+        lat_min_idx, lat_max_idx = np.where(lat_in_mask)[0][[0, -1]]
+        lon_min_idx, lon_max_idx = np.where(lon_in_mask)[0][[0, -1]]
 
-        # Filter to December
-        december_data = combined[combined['month'] == 12]
+        # Subset the data and mask to bounding box
+        data_subset = ds['spei'].isel(
+            lat=slice(lat_min_idx, lat_max_idx + 1),
+            lon=slice(lon_min_idx, lon_max_idx + 1)
+        )
+        mask_subset = mask[lat_min_idx:lat_max_idx + 1, lon_min_idx:lon_max_idx + 1]
 
-        # Average across all cells and all December pentads for each year
-        annual_data = december_data.groupby('year')[spei_var].mean().reset_index()
+        # Apply mask and compute mean across spatial dimensions
+        masked_data = data_subset.where(mask_subset)
+        spatial_mean = masked_data.mean(dim=['lat', 'lon'])
+
+        # Convert to DataFrame and filter to December
+        df = spatial_mean.to_dataframe().reset_index()
+        time_col = 'day' if 'day' in df.columns else 'time'
+        df['year'] = pd.to_datetime(df[time_col]).dt.year
+        df['month'] = pd.to_datetime(df[time_col]).dt.month
+
+        december_data = df[df['month'] == 12]
+        annual_data = december_data.groupby('year')['spei'].mean().reset_index()
         annual_data.columns = ['Year', 'SPEI']
-
-        # Filter to valid years
         annual_data = annual_data[annual_data['Year'] >= 1980]
 
         return annual_data
@@ -809,22 +817,56 @@ def main():
     server_failures = []
 
     try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        # Thread-safe print lock
+        print_lock = threading.Lock()
+
+        def safe_print(*args, **kwargs):
+            with print_lock:
+                print(*args, **kwargs)
+
         wwdt = WestWideDroughtTracker()
         gridmet = GridMETDownloader()
         projections = ClimateProjectionsDownloader()
 
+        print("\n--- Downloading all data sources in parallel ---")
+
         if len(counties) == 1:
-            # Single county
+            # Single county - run all 3 sources in parallel
             county_info = counties[0][0]
-            wwdt_data, wwdt_error = wwdt.download(county_info)
+
+            def download_wwdt():
+                return ('wwdt', wwdt.download(county_info))
+
+            def download_gridmet():
+                return ('gridmet', gridmet.download(county_info))
+
+            def download_projections():
+                return ('projections', projections.download(county_info))
+
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [
+                    executor.submit(download_wwdt),
+                    executor.submit(download_gridmet),
+                    executor.submit(download_projections)
+                ]
+
+                results = {}
+                for future in as_completed(futures):
+                    source, result = future.result()
+                    results[source] = result
+
+            wwdt_data, wwdt_error = results['wwdt']
             if wwdt_error:
                 server_failures.append(("West-Wide Drought Tracker (wrcc.dri.edu)", wwdt_error))
 
-            gridmet_data, gridmet_error = gridmet.download(county_info)
+            gridmet_data, gridmet_error = results['gridmet']
             if gridmet_error:
                 server_failures.append(("GridMET (thredds.northwestknowledge.net)", gridmet_error))
 
-            projections_data, failed_models = projections.download(county_info)
+            projections_data, failed_models = results['projections']
             if failed_models:
                 server_failures.append(("MACA Climate Projections (tds-proxy.nkn.uidaho.edu)",
                                        f"Failed models: {', '.join(failed_models)}"))
@@ -833,29 +875,59 @@ def main():
             safe_state = county_info['state'][:2].upper()
             output_filename = f"{safe_name}_{safe_state}_SPEI.xlsx"
         else:
-            # Multiple counties - weighted average
+            # Multiple counties - download all in parallel
             print()
 
-            # Download WWDT data for all counties
-            wwdt_data_list = []
-            for county_info, weight in counties:
+            def download_wwdt_county(county_info, weight):
                 data, error = wwdt.download(county_info)
-                if error and not any("West-Wide" in f[0] for f in server_failures):
-                    server_failures.append(("West-Wide Drought Tracker (wrcc.dri.edu)", error))
-                wwdt_data_list.append((data, weight))
-            wwdt_data = multi_weighted_average(wwdt_data_list, ['SPEI'])
+                return ('wwdt', county_info['name'], data, weight, error)
 
-            # Download GridMET data for all counties
-            gridmet_data_list = []
-            for county_info, weight in counties:
+            def download_gridmet_county(county_info, weight):
                 data, error = gridmet.download(county_info)
-                if error and not any("GridMET" in f[0] for f in server_failures):
-                    server_failures.append(("GridMET (thredds.northwestknowledge.net)", error))
-                gridmet_data_list.append((data, weight))
-            gridmet_data = multi_weighted_average(gridmet_data_list, ['SPEI'])
+                return ('gridmet', county_info['name'], data, weight, error)
 
-            # For projections, use first county
-            projections_data, failed_models = projections.download(counties[0][0])
+            def download_projections_task():
+                return ('projections', projections.download(counties[0][0]))
+
+            # Submit all tasks in parallel
+            with ThreadPoolExecutor(max_workers=len(counties) * 2 + 1) as executor:
+                futures = []
+
+                # Submit WWDT downloads for all counties
+                for county_info, weight in counties:
+                    futures.append(executor.submit(download_wwdt_county, county_info, weight))
+
+                # Submit GridMET downloads for all counties
+                for county_info, weight in counties:
+                    futures.append(executor.submit(download_gridmet_county, county_info, weight))
+
+                # Submit projections download
+                futures.append(executor.submit(download_projections_task))
+
+                # Collect results
+                wwdt_data_list = []
+                gridmet_data_list = []
+                projections_result = None
+
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result[0] == 'wwdt':
+                        _, name, data, weight, error = result
+                        if error and not any("West-Wide" in f[0] for f in server_failures):
+                            server_failures.append(("West-Wide Drought Tracker (wrcc.dri.edu)", error))
+                        wwdt_data_list.append((data, weight))
+                    elif result[0] == 'gridmet':
+                        _, name, data, weight, error = result
+                        if error and not any("GridMET" in f[0] for f in server_failures):
+                            server_failures.append(("GridMET (thredds.northwestknowledge.net)", error))
+                        gridmet_data_list.append((data, weight))
+                    elif result[0] == 'projections':
+                        projections_result = result[1]
+
+            wwdt_data = multi_weighted_average(wwdt_data_list, ['SPEI'])
+            gridmet_data = multi_weighted_average(gridmet_data_list, ['SPEI'])
+            projections_data, failed_models = projections_result
+
             if failed_models:
                 server_failures.append(("MACA Climate Projections (tds-proxy.nkn.uidaho.edu)",
                                        f"Failed models: {', '.join(failed_models)}"))
