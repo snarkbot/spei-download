@@ -1,4 +1,8 @@
 #!/bin/bash
-BASE="$(cd "$(dirname "$0")" && pwd)"
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+    SOURCE="$(readlink "$SOURCE")"
+done
+BASE="$(cd "$(dirname "$SOURCE")" && pwd)"
 source "$BASE/venv/bin/activate"
 python3 "$BASE/climate_spei_downloader.py" "$@"
