@@ -170,7 +170,7 @@ The output workbook includes a pre-configured Excel Solver setup on the Params s
 1. Open the workbook in Excel
 2. Go to the Params sheet
 3. Run Solver (Data > Solver) -- the objective, variable cells, and constraints are pre-loaded
-4. Solver will minimize MAPE by adjusting the five model parameters
+4. Solver will minimize the sum of squared residuals by adjusting the five model parameters
 
 ## Project Structure
 
