@@ -23,3 +23,9 @@ output/
 *~
 *.tmp
 ~$*
+
+# Drought-demand model (private)
+Drought-demand model/
+Input files/
+drought-model
+drought-model-refit
